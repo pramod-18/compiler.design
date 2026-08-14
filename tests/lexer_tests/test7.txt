@@ -1,0 +1,23 @@
+int main(){
+    auto intt = 5;
+    register float x = -.1;
+    static char whiles = 'a';
+    if(x > 0.0){
+        goto label1;
+    }else{
+        const double returnn = 3.14;
+    }
+    switch(intt){
+        case 1:
+            break;
+        default:
+            extern int externn;
+    }
+    do{
+        int volatilee = 42;
+        whilee = 5;
+    }while (0)
+    label1:
+    signed unsignedVar = 10u;
+    long longVar = 999999L
+}

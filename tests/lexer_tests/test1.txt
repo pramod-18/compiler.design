@@ -1,0 +1,14 @@
+int main(){
+
+    int x = 5, y = x;
+
+    if(x > 5.5){
+        z++;
+    }
+
+    float z = 1.2.3;
+    char c = '\n', d = 'ab';
+    string s = "hel\n\no";
+
+    return 0;
+}

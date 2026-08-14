@@ -1,0 +1,14 @@
+int main(){
+
+    int x = -5ll, y = -.5e-3;
+
+    // int 2z = 4;
+
+    if(x > 5){
+        x = x; /*for while
+        return abc*/ @;
+    }
+
+    return 0;
+}
+/* hello

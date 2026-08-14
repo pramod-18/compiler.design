@@ -1,0 +1,17 @@
+int main(){
+
+    for(intt i = :; j < i; k--){
+        while(i--){
+            else{
+                else++;
+                func(...);
+            }
+            continue;
+        }
+        break;
+    }
+
+    i = j \\// k;
+
+    return 1;
+}

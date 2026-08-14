@@ -1,0 +1,18 @@
+struct cube{
+    int length;
+};
+
+int main(){
+
+    char* str = "hello\n"world";
+
+    int* a, b = a;
+    *b = b - *a;
+
+    a->b->a->b == a::b::a::b
+    b = a.length();
+
+    cube a(5);
+
+    return 0;
+}
