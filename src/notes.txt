@@ -1,9 +1,0 @@
-PENDING
-----------------------------
-string handling
-more operators like += >> ...
-symbol table (maybe)
-neg. no and ULL handling
-try to make INT, FLOAT, and also EXP
-handle ptrs (yacc)
-printf scanf
