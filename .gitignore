@@ -3,4 +3,6 @@ src/lex.yy.c
 src/lex
 src/lex.exe
 
+src/notes.txt
+
 .vscode/

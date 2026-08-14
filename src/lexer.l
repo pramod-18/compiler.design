@@ -87,7 +87,7 @@ void handle_multiline_comment(){
 
     while(true){
         prev = curr;
-        curr = input();
+        curr = yyinput();
 
         // if we have reached end-of-file and the comment hasnt been terminated yet.
         if(curr == EOF || curr == 0){
