@@ -27,7 +27,7 @@ FS          [fFlL]
 EXP         [eE]{S}?{D}+
 
 
-KEYWORD     auto|break|case|char|const|continue|default|do|double|else|enum|extern|float|for|goto|if|inline|int|long|register|restrict|return|short|signed|sizeof|static|struct|switch|typedef|union|unsigned|void|volatile|while
+KEYWORD     auto|break|case|char|const|continue|default|do|double|else|enum|extern|float|for|goto|if|inline|int|long|register|restrict|return|short|signed|sizeof|static|struct|switch|typedef|union|unsigned|until|void|volatile|while
 IDENTIFIER  {L}({L}|{D})*
 INTEGER     {S}?{D}+{IS}?
 FLOAT       {S}?(({D}*"."{D}+)|({D}+"."{D}*)){EXP}?{FS}?
