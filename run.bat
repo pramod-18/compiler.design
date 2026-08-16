@@ -8,3 +8,4 @@ for %%f in (tests\lexer_tests\*.txt) do (
     echo ---------------------------------
 )
 pause
+
