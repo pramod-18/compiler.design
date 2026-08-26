@@ -1,7 +1,13 @@
 src/lex.yy.c
 
+src/parser.tab.c
+src/parser.tab.h
+src/parser.output
+
 src/lex
 src/lex.exe
+src/parser
+src/parser.exe
 
 src/notes.txt
 
