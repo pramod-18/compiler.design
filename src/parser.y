@@ -8,34 +8,31 @@
 #include <set>
 #include <algorithm>
 
+#include "ast.h"
+
 // from lexer.l
 extern int yylex();
 extern char *yytext;
 extern FILE *yyin;
 extern int lexical_error_count;
-extern int token_line;      
-extern int token_column;    
 
 void yyerror(const char *msg);
 
 int syntax_error_count = 0;
 
 
+Node *g_root = NULL;
 
-struct TypeInfo {
-    std::string base;       // "INT", "STRUCT point", "UNSIGNED LONG", etc...
-};
 
-struct DeclInfo {
-    std::string name;
-    int  ptr_depth   = 0;                 // how many *
-    bool is_function = false;
-    std::vector<std::string> dims;        // array dims (outermost first)
-};
+#define BIN(a, b, o)   mk_bin((o), (a), (b), token_line)
 
-struct DeclList {
-    std::vector<DeclInfo *> items;
-};
+
+static Node *empty_stmt(int line) { return mk_node(N_BLOCK, line); }
+
+static void append2(Node *list, Node *item, int line) {
+    if (list) list->kids.push_back(item ? item : empty_stmt(line));
+}
+
 
 static TypeInfo *make_type(const std::string &base) {
     TypeInfo *t = new TypeInfo();
@@ -75,12 +72,7 @@ extern "C" int is_typedef_name(const char *name) {
 }
 
 // Token table
-
-struct TokenRow {
-    std::string lexeme;
-    std::string type;
-};
-static std::vector<TokenRow> token_rows;
+std::vector<TokenRow> token_rows;
 
 
 extern "C" void record_token(const char *lexeme, const char *type) {
@@ -111,14 +103,8 @@ static std::string last_bracket_text() {
 
 // Symbol table structure. Each symbol gets a scope_id
 
-struct Symbol {
-    std::string name;
-    std::string type;   // the Token_Type column: INT, CHAR[20], PROCEDURE, etc...
-    int scope_id;
-    int depth;
-    int line;
-};
-static std::vector<Symbol> symbols;
+// Each symbol gets a scope_id
+std::vector<Symbol> symbols;
 
 static int next_scope_id = 1;
 static std::vector<int> scope_stack = { 0 };   
@@ -181,9 +167,7 @@ static void declare_members(TypeInfo *t, DeclList *l, int line) {
 
 
 %code requires {
-    struct TypeInfo;
-    struct DeclInfo;
-    struct DeclList;
+    #include "ast.h"
 }
 
 %union {
@@ -192,6 +176,7 @@ static void declare_members(TypeInfo *t, DeclList *l, int line) {
     TypeInfo *type;
     DeclInfo *decl;
     DeclList *dlist;
+    Node     *node;
 }
 
 %define parse.error verbose
@@ -221,7 +206,20 @@ static void declare_members(TypeInfo *t, DeclList *l, int line) {
 %type <decl>  declarator direct_declarator init_declarator abstract_declarator
 %type <decl>  struct_declarator parameter_declaration
 %type <dlist> init_declarator_list struct_declarator_list
+%type <dlist> struct_declaration struct_declaration_list
 %type <dlist> parameter_list parameter_type_list parameter_type_list_opt
+
+%type <node>  translation_unit external_declaration function_definition
+%type <node>  declaration
+%type <node>  initializer initializer_list
+%type <node>  statement labeled_statement compound_statement block_item
+%type <node>  block_item_list block_item_list_opt for_init
+%type <node>  expression_statement selection_statement iteration_statement
+%type <node>  jump_statement
+%type <node>  primary_expression string_literal postfix_expression
+%type <node>  argument_expression_list unary_expression cast_expression
+%type <node>  assignment_expression expression
+%type <ival>  unary_operator
 
 
 // Precedence, lowest first. Resolves dangling if-else
@@ -251,30 +249,60 @@ static void declare_members(TypeInfo *t, DeclList *l, int line) {
 
 translation_unit
     : external_declaration
+      { $$ = mk_node(N_PROGRAM, token_line);
+        append($$, $1);
+        g_root = $$; }
     | translation_unit external_declaration
+      { append($1, $2); $$ = $1; g_root = $$; }
     ;
 
 external_declaration
-    : function_definition
-    | declaration
-    | error ';'   { yyerrok; }
+    : function_definition   { $$ = $1; }
+    | declaration           { $$ = $1; }
+    | error ';'             { yyerrok; $$ = NULL; }
     ;
 
 
 function_definition
     : declaration_specifiers declarator compound_statement
-      { add_symbol($2->name, "PROCEDURE", token_line); }
+      { add_symbol($2->name, "PROCEDURE", token_line);
+        $$ = mk_node(N_FUNC, token_line);
+        $$->spec = $1;
+        $$->decl = $2;
+        append($$, $3); }
     ;
-
 
 
 declaration
     : declaration_specifiers init_declarator_list ';'
-      { declare_all($1, $2, token_line); in_typedef = 0; pending_params.clear(); }
+      { declare_all($1, $2, token_line);
+        $$ = mk_node(N_DECL, token_line);
+        $$->spec = $1;
+        for (size_t i = 0; i < $2->items.size(); i++) {
+            $2->items[i]->spec = $1;
+            $2->items[i]->is_typedef = in_typedef;
+            $$->decls.push_back($2->items[i]);
+        }
+        in_typedef = 0; pending_params.clear(); }
     | typedef_kw declaration_specifiers init_declarator_list ';'
-      { declare_all($2, $3, token_line); in_typedef = 0; pending_params.clear(); }
-    | declaration_specifiers ';'          
-      { in_typedef = 0; pending_params.clear(); }
+      { declare_all($2, $3, token_line);
+        $$ = mk_node(N_DECL, token_line);
+        $$->spec = $2;
+        for (size_t i = 0; i < $3->items.size(); i++) {
+            $3->items[i]->spec = $2;
+            $3->items[i]->is_typedef = true;
+            $$->decls.push_back($3->items[i]);
+        }
+        in_typedef = 0; pending_params.clear(); }
+    | declaration_specifiers ';'
+      { in_typedef = 0; pending_params.clear();
+        
+        if ($1 && !$1->members.empty()) {
+            $$ = mk_node(N_DECL, token_line);
+            $$->spec = $1;
+        } else {
+            $$ = NULL;
+        } }
     ;
 
 
@@ -312,10 +340,13 @@ type_qualifier
 struct_specifier
     : STRUCT struct_tag '{' { push_struct($2); } struct_declaration_list '}'
       { $$ = make_type(std::string("STRUCT ") + $2);
+        $$->members = $5->items;
         add_symbol($2, "STRUCT", token_line);
         pop_struct(); free($2); }
     | STRUCT '{' { push_struct(NULL); } struct_declaration_list '}'
-      { $$ = make_type("STRUCT <anonymous>"); pop_struct(); }
+      { $$ = make_type("STRUCT <anonymous>");
+        $$->members = $4->items;
+        pop_struct(); }
     | STRUCT struct_tag
       { $$ = make_type(std::string("STRUCT ") + $2); free($2); }
     ;
@@ -325,14 +356,22 @@ struct_tag
     ;
 
 struct_declaration_list
-    : struct_declaration
-    | struct_declaration_list struct_declaration
+    : struct_declaration                            { $$ = $1; }
+    | struct_declaration_list struct_declaration    { $1->items.insert($1->items.end(),
+                                                         $2->items.begin(), $2->items.end());
+                                                      $$ = $1; }
     ;
 
 struct_declaration
     : declaration_specifiers struct_declarator_list ';'
-      { declare_members($1, $2, token_line); }
+      { declare_members($1, $2, token_line);
+        for (size_t i = 0; i < $2->items.size(); i++) {
+            $2->items[i]->spec = $1;
+            $2->items[i]->line = token_line;
+        }
+        $$ = $2; }
     | declaration_specifiers ';'
+      { $$ = new DeclList(); }
     ;
 
 struct_declarator_list
@@ -351,7 +390,7 @@ init_declarator_list
 
 init_declarator
     : declarator                  { $$ = $1; }
-    | declarator '=' initializer  { $$ = $1; }
+    | declarator '=' initializer  { $1->init = $3; $$ = $1; }
     ;
 
 declarator
@@ -369,11 +408,19 @@ pointer
 
 
 direct_declarator
-    : IDENTIFIER                                       { $$ = make_decl($1); free($1); }
+    : IDENTIFIER                                       { $$ = make_decl($1);
+                                                         $$->line = token_line;
+                                                         free($1); }
     | '(' declarator ')'                               { $$ = $2; }
-    | direct_declarator '[' assignment_expression ']'  { $1->dims.push_back(last_bracket_text()); $$ = $1; }
-    | direct_declarator '[' ']'                        { $1->dims.push_back(""); $$ = $1; }
-    | direct_declarator '(' parameter_type_list_opt ')' { $1->is_function = true; $$ = $1; }
+    | direct_declarator '[' assignment_expression ']'  { $1->dims.push_back(last_bracket_text());
+                                                         $1->dim_exprs.push_back($3);
+                                                         $$ = $1; }
+    | direct_declarator '[' ']'                        { $1->dims.push_back("");
+                                                         $1->dim_exprs.push_back(NULL);
+                                                         $$ = $1; }
+    | direct_declarator '(' parameter_type_list_opt ')' { $1->is_function = true;
+                                                          if ($3) $1->params = $3->items;
+                                                          $$ = $1; }
     ;
 
 parameter_type_list_opt
@@ -393,16 +440,19 @@ parameter_list
 
 parameter_declaration
     : declaration_specifiers declarator
-      { $$ = $2;
+      { $2->spec = $1; $2->line = token_line;
+        $$ = $2;
         pending_params.push_back({ $2->name, type_string($1, $2), 0, 0, token_line }); }
-    | declaration_specifiers abstract_declarator  { $$ = $2; }
-    | declaration_specifiers                      { $$ = make_decl(""); }
+    | declaration_specifiers abstract_declarator  { $2->spec = $1; $$ = $2; }
+    | declaration_specifiers                      { $$ = make_decl(""); $$->spec = $1; }
     ;
 
 
 type_name
     : declaration_specifiers                      { $$ = $1; }
-    | declaration_specifiers abstract_declarator  { $$ = $1; }
+    | declaration_specifiers abstract_declarator  { $$ = $1;
+                                                    $$->ptr_depth = $2->ptr_depth;
+                                                    $$->dims      = $2->dims; }
     ;
 
 abstract_declarator
@@ -413,176 +463,248 @@ abstract_declarator
     ;
 
 initializer
-    : assignment_expression
-    | '{' initializer_list '}'
-    | '{' initializer_list ',' '}'
+    : assignment_expression   { $$ = $1; }
+    | '{' initializer_list '}'       { $$ = $2; }
+    | '{' initializer_list ',' '}'   { $$ = $2; }
     ;
 
 initializer_list
-    : initializer
-    | initializer_list ',' initializer
+    : initializer                              { $$ = mk_node(N_INITLIST, token_line);
+                                                 append($$, $1); }
+    | initializer_list ',' initializer         { append($1, $3); $$ = $1; }
     ;
 
 
 
 statement
-    : labeled_statement
-    | compound_statement
-    | expression_statement
-    | selection_statement
-    | iteration_statement
-    | jump_statement
-    | error ';'   { yyerrok; }   
+    : labeled_statement     { $$ = $1; }
+    | compound_statement    { $$ = $1; }
+    | expression_statement  { $$ = $1; }
+    | selection_statement   { $$ = $1; }
+    | iteration_statement   { $$ = $1; }
+    | jump_statement        { $$ = $1; }
+    | error ';'   { yyerrok; $$ = NULL; }
     ;
 
 
 labeled_statement
-    : IDENTIFIER ':' statement   { free($1); }
+    : IDENTIFIER ':' statement   { $$ = mk_node(N_LABEL, token_line);
+                                   $$->name = $1;
+                                   append($$, $3);
+                                   free($1); }
     ;
+
 
 compound_statement
     : '{' { push_scope(); flush_pending_params(); } block_item_list_opt '}'
-      { pop_scope(); }
+      { pop_scope();
+        
+        $$ = $3 ? $3 : mk_node(N_BLOCK, token_line); }
     ;
 
 
 block_item_list_opt
-    : /* empty */
-    | block_item_list
+    : /* empty */      { $$ = NULL; }
+    | block_item_list  { $$ = $1; }
     ;
 
+
 block_item_list
-    : block_item
-    | block_item_list block_item
+    : block_item                    { $$ = mk_node(N_BLOCK, token_line);
+                                      append($$, $1); }
+    | block_item_list block_item    { append($1, $2); $$ = $1; }
     ;
 
 block_item
-    : declaration
-    | statement
+    : declaration    { $$ = $1; }
+    | statement      { $$ = $1; }
     ;
 
 expression_statement
-    : ';'
-    | expression ';'
+    : ';'                 { $$ = NULL; }
+    | expression ';'      { $$ = mk_node(N_EXPRSTMT, token_line);
+                            append($$, $1); }
     ;
 
 selection_statement
     : IF '(' expression ')' statement %prec IFX
+      { $$ = mk_node(N_IF, token_line);
+        append($$, $3);        // cond
+        append($$, $5); }      // then
     | IF '(' expression ')' statement ELSE statement
+      { $$ = mk_node(N_IF, token_line);
+        append($$, $3);        // cond
+        append($$, $5);        // then
+        append($$, $7); }      // else
     ;
 
 iteration_statement
     : WHILE '(' expression ')' statement
+      { $$ = mk_node(N_WHILE, token_line);
+        append($$, $3); append($$, $5); }
     | DO statement WHILE '(' expression ')' ';'
+      { $$ = mk_node(N_DO, token_line);
+        append($$, $2);        // body
+        append($$, $5); }      // cond
     | UNTIL '(' expression ')' statement          // until loop syntax
+      { $$ = mk_node(N_UNTIL, token_line);
+        append($$, $3); append($$, $5); }
     | FOR '(' for_init expression_statement ')' statement
+      { $$ = mk_node(N_FOR, token_line);
+        append2($$, $3, token_line);   // init
+        append2($$, $4, token_line);   // cond  (may be empty)
+        append2($$, NULL, token_line); // step
+        append($$, $6); }              // body
     | FOR '(' for_init expression_statement expression ')' statement
+      { $$ = mk_node(N_FOR, token_line);
+        append2($$, $3, token_line);   // init
+        append2($$, $4, token_line);   // cond  (may be empty)
+        append2($$, $5, token_line);   // step
+        append($$, $7); }              // body
     ;
 
 for_init
-    : expression_statement
-    | declaration
+    : expression_statement  { $$ = $1; }
+    | declaration           { $$ = $1; }
     ;
 
 jump_statement
-    : GOTO IDENTIFIER ';'  { free($2); }
-    | CONTINUE ';'
-    | BREAK ';'
-    | RETURN ';'
-    | RETURN expression ';'
+    : GOTO IDENTIFIER ';'  { $$ = mk_node(N_GOTO, token_line);
+                             $$->name = $2;
+                             free($2); }
+    | CONTINUE ';'         { $$ = mk_node(N_CONTINUE, token_line); }
+    | BREAK ';'            { $$ = mk_node(N_BREAK, token_line); }
+    | RETURN ';'           { $$ = mk_node(N_RETURN, token_line); }
+    | RETURN expression ';' { $$ = mk_node(N_RETURN, token_line);
+                              append($$, $2); }
     ;
 
 
 
 primary_expression
-    : IDENTIFIER          { free($1); }
-    | INT_LIT             { free($1); }
-    | FLOAT_LIT           { free($1); }
-    | CHAR_LIT            { free($1); }
-    | string_literal
-    | '(' expression ')'
+    : IDENTIFIER          { $$ = mk_id($1, token_line); free($1); }
+    | INT_LIT             { $$ = mk_int($1, token_line); free($1); }
+    | FLOAT_LIT           { $$ = mk_float($1, token_line); free($1); }
+    | CHAR_LIT            { $$ = mk_char($1, token_line); free($1); }
+    | string_literal      { $$ = $1; }
+    | '(' expression ')'  { $$ = $2; }
     ;
 
 
 string_literal
-    : STRING_LIT                { free($1); }
-    | string_literal STRING_LIT { free($2); }
+    : STRING_LIT                { $$ = mk_str($1, token_line); free($1); }
+    | string_literal STRING_LIT { $1->value += $2; $$ = $1; free($2); }
     ;
 
 postfix_expression
-    : primary_expression
-    | postfix_expression '[' expression ']'
-    | postfix_expression '(' ')'
+    : primary_expression                        { $$ = $1; }
+    | postfix_expression '[' expression ']'     { $$ = mk_node(N_INDEX, token_line);
+                                                  append($$, $1); append($$, $3); }
+    | postfix_expression '(' ')'                { $$ = mk_node(N_CALL, token_line);
+                                                  append($$, $1); }
     | postfix_expression '(' argument_expression_list ')'
-    | postfix_expression '.' IDENTIFIER      { free($3); }
-    | postfix_expression ARROW IDENTIFIER    { free($3); }
-    | postfix_expression INC
-    | postfix_expression DEC
+                                                { $$ = mk_node(N_CALL, token_line);
+                                                  append($$, $1);   // callee
+                                                  append($$, $3); } // N_LIST of args
+    | postfix_expression '.' IDENTIFIER         { $$ = mk_node(N_MEMBER, token_line);
+                                                  $$->name = $3;
+                                                  $$->op = ".";
+                                                  append($$, $1); free($3); }
+    | postfix_expression ARROW IDENTIFIER       { $$ = mk_node(N_MEMBER, token_line);
+                                                  $$->name = $3;
+                                                  $$->op = "->";
+                                                  append($$, $1); free($3); }
+    | postfix_expression INC                    { $$ = mk_node(N_UN, token_line);
+                                                  $$->op = "++";
+                                                  append($$, $1); }
+    | postfix_expression DEC                    { $$ = mk_node(N_UN, token_line);
+                                                  $$->op = "--";
+                                                  append($$, $1); }
     ;
 
 
 argument_expression_list
-    : assignment_expression
+    : assignment_expression                      { $$ = mk_list(token_line);
+                                                   append($$, $1); }
     | argument_expression_list ',' assignment_expression
+                                                 { append($1, $3); $$ = $1; }
     ;
 
+
 unary_expression
-    : postfix_expression
-    | INC unary_expression
-    | DEC unary_expression
-    | unary_operator cast_expression  %prec UNARY_PREC
-    | SIZEOF unary_expression
-    | SIZEOF '(' type_name ')'
+    : postfix_expression                   { $$ = $1; }
+    | INC unary_expression                 { $$ = mk_node(N_UN, token_line);
+                                             $$->op = "++";
+                                             append($$, $2); }
+    | DEC unary_expression                 { $$ = mk_node(N_UN, token_line);
+                                             $$->op = "--";
+                                             append($$, $2); }
+    | unary_operator cast_expression %prec UNARY_PREC
+                                           { $$ = mk_un((char)$1, $2, token_line); }
+    | SIZEOF unary_expression              { $$ = mk_node(N_SIZEOF, token_line);
+                                             append($$, $2); }
+    | SIZEOF '(' type_name ')'             { $$ = mk_node(N_SIZEOF, token_line);
+                                             $$->spec = $3; }
     ;
 
 unary_operator
-    : '&' | '*' | '+' | '-' | '~' | '!'
+    : '&'   { $$ = '&'; }
+    | '*'   { $$ = '*'; }
+    | '+'   { $$ = '+'; }
+    | '-'   { $$ = '-'; }
+    | '~'   { $$ = '~'; }
+    | '!'   { $$ = '!'; }
     ;
 
 cast_expression
-    : unary_expression
-    | '(' type_name ')' cast_expression
+    : unary_expression                        { $$ = $1; }
+    | '(' type_name ')' cast_expression       { $$ = mk_node(N_CAST, token_line);
+                                                $$->spec = $2;
+                                                append($$, $4); }
     ;
 
 
+// each operator is its own production
 assignment_expression
-    : cast_expression
-    | assignment_expression '*' assignment_expression
-    | assignment_expression '/' assignment_expression
-    | assignment_expression '%' assignment_expression
-    | assignment_expression '+' assignment_expression
-    | assignment_expression '-' assignment_expression
-    | assignment_expression LEFT_OP assignment_expression
-    | assignment_expression RIGHT_OP assignment_expression
-    | assignment_expression '<' assignment_expression
-    | assignment_expression '>' assignment_expression
-    | assignment_expression LE assignment_expression
-    | assignment_expression GE assignment_expression
-    | assignment_expression EQ assignment_expression
-    | assignment_expression NE assignment_expression
-    | assignment_expression '&' assignment_expression
-    | assignment_expression '^' assignment_expression
-    | assignment_expression '|' assignment_expression
-    | assignment_expression AND_OP assignment_expression
-    | assignment_expression OR_OP assignment_expression
+    : cast_expression                              { $$ = $1; }
+    | assignment_expression '*' assignment_expression   { $$ = BIN($1, $3, "*"); }
+    | assignment_expression '/' assignment_expression   { $$ = BIN($1, $3, "/"); }
+    | assignment_expression '%' assignment_expression   { $$ = BIN($1, $3, "%"); }
+    | assignment_expression '+' assignment_expression   { $$ = BIN($1, $3, "+"); }
+    | assignment_expression '-' assignment_expression   { $$ = BIN($1, $3, "-"); }
+    | assignment_expression LEFT_OP assignment_expression  { $$ = BIN($1, $3, "<<"); }
+    | assignment_expression RIGHT_OP assignment_expression { $$ = BIN($1, $3, ">>"); }
+    | assignment_expression '<' assignment_expression   { $$ = BIN($1, $3, "<"); }
+    | assignment_expression '>' assignment_expression   { $$ = BIN($1, $3, ">"); }
+    | assignment_expression LE assignment_expression    { $$ = BIN($1, $3, "<="); }
+    | assignment_expression GE assignment_expression    { $$ = BIN($1, $3, ">="); }
+    | assignment_expression EQ assignment_expression    { $$ = BIN($1, $3, "=="); }
+    | assignment_expression NE assignment_expression    { $$ = BIN($1, $3, "!="); }
+    | assignment_expression '&' assignment_expression   { $$ = BIN($1, $3, "&"); }
+    | assignment_expression '^' assignment_expression   { $$ = BIN($1, $3, "^"); }
+    | assignment_expression '|' assignment_expression   { $$ = BIN($1, $3, "|"); }
+    | assignment_expression AND_OP assignment_expression { $$ = BIN($1, $3, "&&"); }
+    | assignment_expression OR_OP  assignment_expression { $$ = BIN($1, $3, "||"); }
     | assignment_expression '?' assignment_expression ':' assignment_expression
-    | assignment_expression '=' assignment_expression
-    | assignment_expression ADD_ASSIGN assignment_expression
-    | assignment_expression SUB_ASSIGN assignment_expression
-    | assignment_expression MUL_ASSIGN assignment_expression
-    | assignment_expression DIV_ASSIGN assignment_expression
-    | assignment_expression MOD_ASSIGN assignment_expression
-    | assignment_expression LEFT_ASSIGN assignment_expression
-    | assignment_expression RIGHT_ASSIGN assignment_expression
-    | assignment_expression AND_ASSIGN assignment_expression
-    | assignment_expression XOR_ASSIGN assignment_expression
-    | assignment_expression OR_ASSIGN assignment_expression
+                                     { $$ = mk_node(N_TERNARY, token_line);
+                                       append($$, $1); append($$, $3); append($$, $5); }
+    | assignment_expression '=' assignment_expression        { $$ = mk_assign($1, $3, token_line); }
+    | assignment_expression ADD_ASSIGN assignment_expression  { $$ = mk_assign($1, $3, token_line); $$->op = "+="; }
+    | assignment_expression SUB_ASSIGN assignment_expression  { $$ = mk_assign($1, $3, token_line); $$->op = "-="; }
+    | assignment_expression MUL_ASSIGN assignment_expression  { $$ = mk_assign($1, $3, token_line); $$->op = "*="; }
+    | assignment_expression DIV_ASSIGN assignment_expression  { $$ = mk_assign($1, $3, token_line); $$->op = "/="; }
+    | assignment_expression MOD_ASSIGN assignment_expression  { $$ = mk_assign($1, $3, token_line); $$->op = "%="; }
+    | assignment_expression LEFT_ASSIGN assignment_expression { $$ = mk_assign($1, $3, token_line); $$->op = "<<="; }
+    | assignment_expression RIGHT_ASSIGN assignment_expression { $$ = mk_assign($1, $3, token_line); $$->op = ">>="; }
+    | assignment_expression AND_ASSIGN assignment_expression  { $$ = mk_assign($1, $3, token_line); $$->op = "&="; }
+    | assignment_expression XOR_ASSIGN assignment_expression  { $$ = mk_assign($1, $3, token_line); $$->op = "^="; }
+    | assignment_expression OR_ASSIGN assignment_expression   { $$ = mk_assign($1, $3, token_line); $$->op = "|="; }
     ;
 
 
 expression
-    : assignment_expression
-    | expression ',' assignment_expression
+    : assignment_expression                    { $$ = $1; }
+    | expression ',' assignment_expression     { $$ = BIN($1, $3, ","); }
     ;
 
 %%
@@ -593,67 +715,4 @@ void yyerror(const char *msg) {
     fprintf(stderr, "Syntax error at line %d, column %d: unexpected '%s' -- %s\n",
             token_line, token_column,
             (yytext && *yytext) ? yytext : "<end of file>", msg);
-}
-
-
-
-static void print_table(const char *title, const std::vector<TokenRow> &rows) {
-    printf("\n=== %s ===\n", title);
-    printf("%-20s %s\n", "Token", "Token_Type");
-    printf("%-20s %s\n", "-------------------", "-----------------");
-    for (size_t i = 0; i < rows.size(); i++)
-        printf("%-20s %s\n", rows[i].lexeme.c_str(), rows[i].type.c_str());
-}
-
-static void print_symbol_table() {
-    // prints globals and then locals in depth order
-    std::vector<Symbol> sorted = symbols;
-    std::stable_sort(sorted.begin(), sorted.end(),
-                     [](const Symbol &a, const Symbol &b) { return a.depth < b.depth; });
-
-    std::vector<TokenRow> rows;
-    for (size_t i = 0; i < sorted.size(); i++)
-        rows.push_back({ sorted[i].name, sorted[i].type });
-    print_table("SYMBOL TABLE", rows);
-}
-
-static void usage(const char *prog) {
-    fprintf(stderr, "usage: %s [-t | -s] [file]\n", prog);
-    fprintf(stderr, "  -t   print the token table only\n");
-    fprintf(stderr, "  -s   print the symbol table only\n");
-    fprintf(stderr, "  with no file argument, reads standard input\n");
-}
-
-int main(int argc, char **argv) {
-    bool want_tokens = true, want_symbols = true;
-    const char *path = NULL;
-
-    for (int i = 1; i < argc; i++) {
-        if      (!strcmp(argv[i], "-t")) want_symbols = false;
-        else if (!strcmp(argv[i], "-s")) want_tokens  = false;
-        else if (!strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
-        else if (argv[i][0] == '-')      { usage(argv[0]); return 2; }
-        else                             path = argv[i];
-    }
-
-    if (path) {
-        yyin = fopen(path, "r");
-        if (!yyin) {
-            fprintf(stderr, "error: cannot open '%s'\n", path);
-            return 2;
-        }
-    }
-
-    yyparse();
-
-    if (lexical_error_count + syntax_error_count == 0) {
-        if (want_tokens)  print_table("TOKEN TABLE", token_rows);
-        if (want_symbols) print_symbol_table();
-        printf("\nParsing completed successfully: no errors.\n");
-        return 0;
-    }
-
-    fprintf(stderr, "\nParsing failed: %d lexical error(s), %d syntax error(s).\n",
-            lexical_error_count, syntax_error_count);
-    return 1;
 }
