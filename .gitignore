@@ -8,6 +8,10 @@ src/lex
 src/lex.exe
 src/parser
 src/parser.exe
+src/irgen
+src/irgen.exe
+
+tests/ir_tests/out/
 
 src/notes.txt
 
