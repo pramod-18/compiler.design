@@ -1,33 +1,20 @@
-#!/bin/bash
-# Build, then run the tests.
-#
-#   ./run.sh                 all of tests/parser_tests
-#   ./run.sh test5           just that one test, full output
-#   ./run.sh err3            works for invalid tests too
-#   ./run.sh path/to/x.c     or give a path directly
-#   ./run.sh --verbose       whole sweep, showing each parser's full output
-#   ./run.sh --lexer         all of tests/lexer_tests
-#
-# valid/   must parse cleanly   -> exit 0
-# invalid/ must report an error -> exit non-zero
-#
-# Both directions are checked, since an invalid test that parses is just as broken as a valid one that doesn't.
-# Exits non-zero if anything is off.
-
 VALID_DIR=tests/parser_tests/valid
 INVALID_DIR=tests/parser_tests/invalid
+IR_DIR=tests/ir_tests
+IR_OUT=$IR_DIR/out
 
 VERBOSE=0
 MODE=parser
 ONLY=
 
 usage() {
-    echo "usage: ./run.sh [--lexer] [--verbose] [test-name | path/to/test.c]"
+    echo "usage: ./run.sh [--lexer | --ir] [--verbose] [test-name | path/to/test.c]"
 }
 
 for arg in "$@"; do
     case "$arg" in
         --lexer)   MODE=lexer ;;
+        --ir)      MODE=ir ;;
         --verbose) VERBOSE=1 ;;
         -h|--help) usage; exit 0 ;;
         -*)
@@ -70,6 +57,164 @@ if [ "$MODE" = lexer ]; then
 
     echo "=============================================================="
     echo "Lex sweep complete."
+    exit 0
+fi
+
+
+if [ "$MODE" = ir ]; then
+
+    if [ ! -x ./src/irgen ] && [ ! -x ./src/irgen.exe ]; then
+        echo "Error: irgen executable not found in ./src/" >&2
+        exit 1
+    fi
+
+    mkdir -p "$IR_OUT"
+
+
+    expect_for() {
+        case "$(basename "$1")" in
+            bad*) echo error ;;
+            *)    echo clean ;;
+        esac
+    }
+
+
+    ir_problems() {
+        local ir="$1" problems="" tgt
+        local labels gotos
+
+        labels=$(grep -oE '^L[0-9]+:' "$ir" | tr -d ':' | sort -u)
+        gotos=$(grep -oE 'GOTO L[0-9]+' "$ir" | sed 's/GOTO //' | sort -u)
+        for tgt in $gotos; do
+            printf '%s\n' "$labels" | grep -qx "$tgt" || problems="$problems dangling jump to $tgt;"
+        done
+
+        if grep -qE '\?\?\?|\(null\)|nan' "$ir"; then
+            problems="$problems placeholder text;"
+        fi
+        printf '%s' "$problems"
+    }
+
+    ir_one() {
+        local testfile="$1" expect="$2"
+        local base name ir out status problems
+
+        base=$(basename "$testfile")
+        name="${base%.c}"
+        ir="$IR_OUT/$name.ir"
+
+        out=$(./src/irgen -o "$ir" "$testfile" 2>&1)
+        status=$?
+
+        if [ "$expect" = error ]; then
+            if [ "$status" -ne 0 ] && [ ! -f "$ir" ]; then
+                PASS=$((PASS + 1))
+                printf 'PASS  %-12s rejected, %s semantic error(s)\n' "$base" \
+                    "$(printf '%s\n' "$out" | grep -c 'error:')"
+            else
+                FAIL=$((FAIL + 1))
+                if [ "$status" -eq 0 ]; then
+                    printf 'FAIL  %-12s should have been rejected, exit 0\n' "$base"
+                else
+                    printf 'FAIL  %-12s rejected but still wrote %s\n' "$base" "$ir"
+                fi
+                printf '%s\n' "$out" | sed 's/^/        | /'
+            fi
+
+            if [ "$VERBOSE" -eq 1 ]; then
+                printf '%s\n' "$out" | sed 's/^/        | /'
+                echo
+            fi
+            return
+        fi
+
+        if [ "$status" -ne 0 ]; then
+            FAIL=$((FAIL + 1))
+            printf 'FAIL  %-12s expected IR, exit %d\n' "$base" "$status"
+            printf '%s\n' "$out" | sed 's/^/        | /'
+            return
+        fi
+
+        if [ ! -s "$ir" ]; then
+            FAIL=$((FAIL + 1))
+            printf 'FAIL  %-12s wrote an empty .ir\n' "$base"
+            return
+        fi
+
+        problems=$(ir_problems "$ir")
+        if [ -n "$problems" ]; then
+            FAIL=$((FAIL + 1))
+            printf 'FAIL  %-12s %s\n' "$base" "$problems"
+            return
+        fi
+
+        PASS=$((PASS + 1))
+        printf 'PASS  %-12s %s lines of IR -> %s\n' "$base" \
+            "$(wc -l < "$ir" | tr -d ' ')" "$ir"
+
+        if [ "$VERBOSE" -eq 1 ]; then
+            sed 's/^/        | /' "$ir"
+            echo
+        fi
+    }
+
+    if [ -n "$ONLY" ]; then
+
+        if [ -f "$ONLY" ]; then
+            target="$ONLY"
+        elif [ -f "$IR_DIR/${ONLY%.c}.c" ]; then
+            target="$IR_DIR/${ONLY%.c}.c"
+        else
+            echo "No such IR test: $ONLY" >&2
+            echo "available:" >&2
+            ls "$IR_DIR"/*.c 2>/dev/null | sed 's|.*/|  |' >&2
+            exit 2
+        fi
+
+        expect=$(expect_for "$target")
+        echo "=============================================================="
+        echo "$target  (expecting $([ "$expect" = clean ] && echo "IR" || echo "rejection"))"
+        echo "=============================================================="
+        VERBOSE=1
+        ir_one "$target" "$expect"
+
+        [ "$FAIL" -eq 0 ] || exit 1
+        exit 0
+    fi
+
+    echo "=============================================================="
+    echo "Valid programs -- must produce IR"
+    echo "=============================================================="
+    for testfile in "$IR_DIR"/*.c; do
+        [ -e "$testfile" ] || continue
+        [ "$(expect_for "$testfile")" = clean ] || continue
+        ir_one "$testfile" clean
+    done
+
+    echo
+    echo "=============================================================="
+    echo "Invalid programs -- must be rejected, with no .ir written"
+    echo "=============================================================="
+    for testfile in "$IR_DIR"/*.c; do
+        [ -e "$testfile" ] || continue
+        [ "$(expect_for "$testfile")" = error ] || continue
+        ir_one "$testfile" error
+    done
+
+    TOTAL=$((PASS + FAIL))
+    echo
+    echo "=============================================================="
+    echo "Summary: $PASS/$TOTAL as expected"
+    echo "=============================================================="
+
+    if [ "$FAIL" -ne 0 ]; then
+        echo "$FAIL test(s) did not behave as expected." >&2
+        exit 1
+    fi
+
+    echo
+    echo "./run.sh --ir test5      one test, printing the IR it made"
+    echo "./run.sh --ir --verbose  IR for every test"
     exit 0
 fi
 
@@ -181,3 +326,4 @@ echo
 echo "./run.sh test5      to run one test and see its full output"
 echo "./run.sh --verbose  to see full output for everything"
 echo "./run.sh --lexer    for the phase 1 lexeme tables"
+echo "./run.sh --ir       for the phase 3 intermediate code"
