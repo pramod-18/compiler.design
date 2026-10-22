@@ -1,30 +1,4 @@
-# Build recipes.
-#
-#   make            build both executables
-#   make lexer      src/lex     (lexeme/class table)
-#   make parser     src/parser  (syntax analyzer)
-#   make test       build, then run ./run.sh
-#   make tools      show which flex/bison this makefile picked
-#   make clean      remove generated files
-#
-# Needs g++, flex and bison. If you don't have flex/bison:
-#   linux    sudo apt install flex bison
-#   mac      brew install flex bison
-#   windows  winget install WinFlexBison.win_flex_bison
-
-# Where winget puts WinFlexBison. Empty/unmatched everywhere else, which is the
-# point -- $(wildcard) on a path that doesn't exist just vanishes.
-
 WINGET_PKGS := $(LOCALAPPDATA)/Microsoft/WinGet/Packages
-
-# Tries in order: win_bison on PATH, the winget dir, then plain bison. Names
-# found on PATH stay bare so the OS resolves them -- a path out of 'command -v'
-# would be bash-style, which CreateProcess can't exec.
-#
-# The last entry is unconditional, so this is never empty. On linux/mac the
-# first two can't match and you get plain 'bison'. If it isn't installed you
-# get a normal "bison: command not found" instead of make guessing. Override
-# any time:  make BISON=/usr/bin/bison FLEX=/usr/bin/flex
 
 BISON ?= $(firstword \
 	$(shell command -v win_bison >/dev/null 2>&1 && echo win_bison) \
@@ -44,13 +18,15 @@ EXE := $(if $(findstring Windows,$(OS)),.exe,)
 
 LEXER  := $(SRC)/lex$(EXE)
 PARSER := $(SRC)/parser$(EXE)
+IRGEN  := $(SRC)/irgen$(EXE)
 
-.PHONY: all lexer parser test tools check-grammar clean help
+.PHONY: all lexer parser irgen test tools check-grammar clean help
 
-all: lexer parser
+all: lexer parser irgen
 
 lexer: $(LEXER)
 parser: $(PARSER)
+irgen: $(IRGEN)
 
 
 $(SRC)/parser.tab.c $(SRC)/parser.tab.h: $(SRC)/parser.y
@@ -62,11 +38,18 @@ $(SRC)/lex.yy.c: $(SRC)/lexer.l $(SRC)/parser.tab.h
 $(LEXER): $(SRC)/lex.yy.c $(SRC)/lex_driver.cpp
 	$(CXX) $(CXXFLAGS) -I$(SRC) $^ -o $@
 
-$(PARSER): $(SRC)/lex.yy.c $(SRC)/parser.tab.c
+$(PARSER): $(SRC)/lex.yy.c $(SRC)/parser.tab.c $(SRC)/ast.cpp $(SRC)/parser_driver.cpp
+	$(CXX) $(CXXFLAGS) -I$(SRC) $^ -o $@
+
+$(IRGEN): $(SRC)/lex.yy.c $(SRC)/parser.tab.c $(SRC)/ast.cpp \
+          $(SRC)/semantic.cpp $(SRC)/irgen.cpp $(SRC)/ir_driver.cpp
 	$(CXX) $(CXXFLAGS) -I$(SRC) $^ -o $@
 
 test: all
 	./run.sh
+
+ir: all
+	./run.sh --ir
 
 
 tools:
@@ -83,13 +66,17 @@ check-grammar: $(SRC)/parser.y
 
 clean:
 	rm -f $(SRC)/lex $(SRC)/lex.exe $(SRC)/parser $(SRC)/parser.exe
+	rm -f $(SRC)/irgen $(SRC)/irgen.exe
 	rm -f $(SRC)/lex.yy.c $(SRC)/parser.tab.c $(SRC)/parser.tab.h $(SRC)/parser.output
+	rm -f tests/ir_tests/out/*.ir
 
 help:
-	@echo "make          build both executables"
-	@echo "make lexer    lexical analyzer -> $(LEXER)"
-	@echo "make parser   syntax analyzer  -> $(PARSER)"
+	@echo "make          build all three executables"
+	@echo "make lexer    lexical analyzer    -> $(LEXER)"
+	@echo "make parser   syntax analyzer     -> $(PARSER)"
+	@echo "make irgen    IR generator        -> $(IRGEN)"
 	@echo "make test     build, then run ./run.sh"
+	@echo "make ir       build, then run ./run.sh --ir"
 	@echo "make tools    show/check the detected flex, bison and g++"
 	@echo "make clean    remove generated files"
 	@echo ""
