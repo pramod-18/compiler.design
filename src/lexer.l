@@ -55,7 +55,7 @@ INTEGER     {D}+{IS}?
 FLOAT       (({D}*"."{D}+)|({D}+"."{D}*)){EXP}?{FS}?
 CHARACTER   \'([^\\']|\\.)\'
 STRING      \"([^\\"]|\\.)*\"
-WHITESPACE  [ \t]+
+WHITESPACE  [ \t\r]+
 NEWLINE     [\n]
 
 %%
