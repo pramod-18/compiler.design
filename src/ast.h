@@ -5,6 +5,7 @@
 
 struct Node;
 struct DeclInfo;
+struct Type;
 
 
 struct TypeInfo {
@@ -15,6 +16,7 @@ struct TypeInfo {
 };
 
 struct DeclInfo {
+    Type *type = nullptr;                  // resolved by semantic analysis
     std::string name;
     int  ptr_depth   = 0;
     bool is_function = false;
@@ -23,6 +25,7 @@ struct DeclInfo {
     std::vector<DeclInfo *> params;         // functions only
     Node *init       = nullptr;             // "= <initializer>", if any
     bool is_typedef  = false;
+    bool is_parameter = false;
     std::vector<Node *> dim_exprs;          // [..] expressions, for semantic to fold
     int line = 0;
 };
@@ -74,6 +77,7 @@ struct Node {
     bool  lvalue = false;
     int   const_val = 0;
     bool  has_const = false;
+    bool  postfix = false;
 };
 
 
