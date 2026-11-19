@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -15,12 +16,17 @@ namespace {
 struct Sym {
     Type *type = nullptr;
     bool  is_function = false;
+    DeclInfo *decl = nullptr;
 };
 
 struct StructInfo {
     std::vector<std::pair<std::string, Type *> > members;
+    std::vector<int> offsets;
     int size = 0;
+    int alignment = 1;
 };
+
+std::map<std::string, StructInfo> saved_structs;
 
 // what a function signature looks like, for call checking
 struct FuncSig {
@@ -80,6 +86,7 @@ public:
 
 
     Type *type_from(TypeInfo *spec, DeclInfo *d) {
+        if (d && d->type) return d->type;
         Type *t = new Type();
         t->base = spec ? spec->base : "INT";
         if (spec && !spec->members.empty()) register_struct(spec);
@@ -97,13 +104,32 @@ public:
         if (d) {
             for (size_t i = 0; i < d->dims.size(); i++) {
                 int n = 0;
-                if (i < d->dim_exprs.size() && d->dim_exprs[i] &&
-                    d->dim_exprs[i]->has_const)
+                if (i < d->dim_exprs.size() && d->dim_exprs[i]) {
+                    check_expr(d->dim_exprs[i]);
+                    if (!d->dim_exprs[i]->has_const || d->dim_exprs[i]->type->is_float())
+                        err(d->line, "array bound must be a positive integer constant");
                     n = d->dim_exprs[i]->const_val;
+                    if (n <= 0) err(d->line, "array bound must be positive");
+                }
                 else if (!d->dims[i].empty() && d->dims[i] != "_")
                     n = atoi(d->dims[i].c_str());
+                else if (i == 0 && d->init) {
+                    if (d->init->kind == N_STR)
+                        n = (int)decode_string_literal(d->init->value).size() + 1;
+                    else if (d->init->kind == N_INITLIST) {
+                        int stride = 1;
+                        for (size_t j = 1; j < d->dim_exprs.size(); j++) {
+                            if (d->dim_exprs[j]) check_expr(d->dim_exprs[j]);
+                            stride *= d->dim_exprs[j] ? d->dim_exprs[j]->const_val : 1;
+                        }
+                        n = (int)d->init->kids.size();
+                        if (n && d->init->kids[0]->kind != N_INITLIST && stride > 1)
+                            n = (n + stride - 1) / stride;
+                    }
+                }
                 t->dims.push_back(n);
             }
+            d->type = t;
         }
         return t;
     }
@@ -125,25 +151,11 @@ public:
 
     void record_typedef(const std::string &name, TypeInfo *spec, DeclInfo *d) {
         if (name.empty()) return;
+        Type *resolved = type_from(spec, d);
         Typedef td;
-        td.base = spec ? spec->base : "INT";
-        td.ptr_depth = d ? d->ptr_depth : 0;
-        std::map<std::string, Typedef>::iterator prev = typedef_map.find(td.base);
-        if (prev != typedef_map.end()) {
-            td.base      = prev->second.base;
-            td.ptr_depth += prev->second.ptr_depth;
-            td.dims      = prev->second.dims;
-        }
-        if (d) {
-            for (size_t i = 0; i < d->dim_exprs.size(); i++) {
-                if (d->dim_exprs[i] && d->dim_exprs[i]->has_const)
-                    td.dims.push_back(d->dim_exprs[i]->const_val);
-                else if (i < d->dims.size() && !d->dims[i].empty() && d->dims[i] != "_")
-                    td.dims.push_back(atoi(d->dims[i].c_str()));
-                else
-                    td.dims.push_back(0);
-            }
-        }
+        td.base = resolved->base;
+        td.ptr_depth = resolved->ptr_depth;
+        td.dims = resolved->dims;
         typedef_map[name] = td;
     }
 
@@ -173,15 +185,29 @@ public:
         if (structs.count(tag)) return;      
 
         StructInfo si;
+        structs[tag] = si; 
         int off = 0;
         for (size_t i = 0; i < spec->members.size(); i++) {
             DeclInfo *m = spec->members[i];
             Type *mt = type_from(m->spec, m);
+            int align = alignment_of(*mt);
+            si.alignment = std::max(si.alignment, align);
+            off = (off + align - 1) / align * align;
             si.members.push_back(std::make_pair(m->name, mt));
+            si.offsets.push_back(off);
             off += size_of(mt);
         }
-        si.size = off > 0 ? off : 4;
+        si.size = off > 0 ? (off + si.alignment - 1) / si.alignment * si.alignment : 4;
         structs[tag] = si;
+    }
+
+    int alignment_of(Type t) {
+        t.dims.clear();
+        if (t.ptr_depth) return 4;
+        if (t.base == "CHAR") return 1;
+        if (t.base == "DOUBLE") return 8;
+        if (t.is_struct() && structs.count(t.tag())) return structs[t.tag()].alignment;
+        return 4;
     }
 
     int size_of(const Type *t) {
@@ -224,7 +250,7 @@ public:
         return scopes.back().count(name) != 0;
     }
 
-    void declare(const std::string &name, Type *t, int line, bool is_func) {
+    void declare(const std::string &name, Type *t, int line, bool is_func, DeclInfo *d = nullptr) {
         if (name.empty()) return;
         if (scopes.back().count(name)) {
             err(line, "'" + name + "' is already declared in this scope");
@@ -233,6 +259,7 @@ public:
         Sym s;
         s.type = t;
         s.is_function = is_func;
+        s.decl = d;
         scopes.back()[name] = s;
     }
 
@@ -257,7 +284,10 @@ public:
 
 
     void add_builtin(const char *name, const char *ret) {
-        Type *rt = T(ret, strchr(ret, '*') ? 1 : 0);
+        std::string base(ret);
+        bool pointer = base.find('*') != std::string::npos;
+        if (pointer) base.erase(base.find('*'));
+        Type *rt = T(base, pointer ? 1 : 0);
         Sym s;
         s.type = rt;
         s.is_function = true;
@@ -306,6 +336,9 @@ public:
 
         if (n->kind == N_FUNC) {
             Type *ret = type_from(n->spec, NULL);
+            ret->ptr_depth += n->decl->ptr_depth;
+            n->type = ret;
+            n->decl->type = ret;
             cur_ret = ret;
 
             Type *ft = copy(ret);
@@ -338,7 +371,7 @@ public:
                     fs.ret = t;
                     if (!fs.defined) collect_params(d->params, fs.params);
                 } else {
-                    declare(d->name, t, n->line, false);
+                    declare(d->name, t, n->line, false, d);
                 }
             }
             return;
@@ -361,6 +394,7 @@ public:
     }
 
     Type *usual(const Type *a, const Type *b) {
+        if ((a && a->base == "DOUBLE") || (b && b->base == "DOUBLE")) return T("DOUBLE");
         if ((a && a->is_float()) || (b && b->is_float())) return T("FLOAT");
         return T("INT");
     }
@@ -386,6 +420,19 @@ public:
         else if (n->op == "*") { n->const_val = x * y; n->has_const = true; }
         else if (n->op == "/") { if (y) { n->const_val = x / y; n->has_const = true; } }
         else if (n->op == "%") { if (y) { n->const_val = x % y; n->has_const = true; } }
+        else if (n->op == "<<" && y >= 0 && y < 32) { n->const_val = (int)((unsigned)x << y); n->has_const = true; }
+        else if (n->op == ">>" && y >= 0 && y < 32) { n->const_val = x >> y; n->has_const = true; }
+        else if (n->op == "&") { n->const_val = x & y; n->has_const = true; }
+        else if (n->op == "|") { n->const_val = x | y; n->has_const = true; }
+        else if (n->op == "^") { n->const_val = x ^ y; n->has_const = true; }
+        else if (n->op == "==") { n->const_val = x == y; n->has_const = true; }
+        else if (n->op == "!=") { n->const_val = x != y; n->has_const = true; }
+        else if (n->op == "<") { n->const_val = x < y; n->has_const = true; }
+        else if (n->op == ">") { n->const_val = x > y; n->has_const = true; }
+        else if (n->op == "<=") { n->const_val = x <= y; n->has_const = true; }
+        else if (n->op == ">=") { n->const_val = x >= y; n->has_const = true; }
+        else if (n->op == "&&") { n->const_val = x && y; n->has_const = true; }
+        else if (n->op == "||") { n->const_val = x || y; n->has_const = true; }
     }
 
     Type *expr(Node *n) {
@@ -395,13 +442,13 @@ public:
 
         case N_INT:
             n->has_const = true;
-            n->const_val = (int)strtol(n->value.c_str(), NULL, 0);
+            n->const_val = (int)strtoul(n->value.c_str(), NULL, 10);
             return T("INT");
 
         case N_FLOAT:
             n->has_const = true;
             n->const_val = (int)atof(n->value.c_str());
-            return T("FLOAT");
+            return T(n->value.back() == 'f' || n->value.back() == 'F' ? "FLOAT" : "DOUBLE");
 
         case N_CHAR: {
             int c = 0;
@@ -410,6 +457,11 @@ public:
                     switch (n->value[2]) {
                         case 'n': c = '\n'; break;
                         case 't': c = '\t'; break;
+                        case 'r': c = '\r'; break;
+                        case 'a': c = '\a'; break;
+                        case 'b': c = '\b'; break;
+                        case 'f': c = '\f'; break;
+                        case 'v': c = '\v'; break;
                         case '0': c = '\0'; break;
                         case '\\': c = '\\'; break;
                         case '\'': c = '\''; break;
@@ -424,7 +476,7 @@ public:
 
         case N_STR: {
             Type *t = T("CHAR");
-            t->dims.push_back((int)n->value.size());
+            t->dims.push_back((int)decode_string_literal(n->value).size() + 1);
             n->lvalue = true;
             return t;
         }
@@ -436,6 +488,7 @@ public:
                 return T("INT");
             }
             n->lvalue = !s->is_function;
+            n->decl = s->decl;
             Type *t = copy(s->type);
             if (s->is_function) {
                 n->lvalue = false;
@@ -447,7 +500,7 @@ public:
             if (n->kids.size() < 2) return T("INT");
             Type *base  = check_expr(n->kids[0]);
             Type *index = check_expr(n->kids[1]);
-            if (!index || index->ptr_depth > 0)
+            if (!index || !is_arith(index) || index->is_float())
                 err(n->line, "array subscript is not an integer");
 
             if (!base) return T("INT");
@@ -473,15 +526,15 @@ public:
             if (!base) return T("INT");
 
             bool arrow = (n->op == "->");
+            Type pointed = *base;
             if (arrow) {
                 if (base->ptr_depth == 0) {
                     err(n->line, "'->' needs a pointer on the left, got '" +
                                  base->base + "'");
                     return T("INT");
                 }
-                Type tmp = *base;
-                tmp.ptr_depth--;
-                base = &tmp;
+                pointed.ptr_depth--;
+                base = &pointed;
             }
             if (!base->is_struct()) {
                 err(n->line, "'.' needs a struct on the left, got '" +
@@ -541,18 +594,25 @@ public:
                 n->lvalue = n->kids[0]->lvalue;
                 return copy(a);
             }
+            if (n->kids[0]->has_const) {
+                int v = n->kids[0]->const_val;
+                n->has_const = true;
+                n->const_val = n->op == "-" ? -v : n->op == "~" ? ~v : n->op == "!" ? !v : v;
+            }
+            if (n->op == "!") return T("INT");
             if (!is_arith(a))
                 err(n->line, "operator '" + n->op + "' does not work on '" +
                              (a ? a->base : "?") + "'");
-            return a && a->is_float() ? T("FLOAT") : T("INT");
+            return a && a->is_float() ? copy(a) : T("INT");
         }
 
         case N_BIN: {
             if (n->kids.size() < 2) return T("INT");
-            if (n->op == ",") return check_expr(n->kids[1]);
+            if (n->op == ",") { check_expr(n->kids[0]); return check_expr(n->kids[1]); }
 
             Type *a = check_expr(n->kids[0]);
             Type *b = check_expr(n->kids[1]);
+            try_fold(n);
 
             bool cmp = (n->op == "<" || n->op == ">" || n->op == "<=" ||
                         n->op == ">=" || n->op == "==" || n->op == "!=");
@@ -568,6 +628,7 @@ public:
 
             if ((a && a->ptr_depth > 0) || (b && b->ptr_depth > 0)) {
                 if (cmp || logi) return T("INT");
+                if (n->op == "-" && a->ptr_depth && b->ptr_depth) return T("INT");
                 if (n->op == "+" || n->op == "-") return a && a->ptr_depth > 0 ? copy(a) : copy(b);
             }
 
@@ -584,6 +645,8 @@ public:
             check_expr(n->kids[0]);
             Type *a = check_expr(n->kids[1]);
             Type *b = check_expr(n->kids[2]);
+            if (a->ptr_depth || !a->dims.empty()) return copy(a);
+            if (b->ptr_depth || !b->dims.empty()) return copy(b);
             return usual(a, b);
         }
 
@@ -600,7 +663,8 @@ public:
             }
 
             if (n->op != "=") {
-                if (!is_arith(lt))
+                bool pointer_update = lt->ptr_depth && (n->op == "+=" || n->op == "-=");
+                if (!is_arith(lt) && !pointer_update)
                     err(n->line, "compound assignment needs a number on the left");
                 if (!is_arith(rt))
                     err(n->line, "compound assignment needs a number on the right");
@@ -612,8 +676,8 @@ public:
         case N_CAST: {
             if (n->kids.empty()) return T("INT");
             check_expr(n->kids[0]);
-            Type *t = T(n->spec ? n->spec->base : "INT",
-                        n->spec ? n->spec->ptr_depth : 0);
+            Type *t = type_from(n->spec, nullptr);
+            t->ptr_depth += n->spec ? n->spec->ptr_depth : 0;
             if (n->spec) {
                 for (size_t i = 0; i < n->spec->dims.size(); i++)
                     t->dims.push_back(atoi(n->spec->dims[i].c_str()));
@@ -623,7 +687,8 @@ public:
 
         case N_SIZEOF: {
             if (n->spec) {
-                Type *t = T(n->spec->base, n->spec->ptr_depth);
+                Type *t = type_from(n->spec, nullptr);
+                t->ptr_depth += n->spec->ptr_depth;
                 for (size_t i = 0; i < n->spec->dims.size(); i++)
                     t->dims.push_back(atoi(n->spec->dims[i].c_str()));
                 if (n->spec->base == "STRUCT" || n->spec->base.empty())
@@ -635,7 +700,8 @@ public:
             if (n->kids.empty()) return T("INT");
             Type *t = check_expr(n->kids[0]);
             n->has_const = true;
-            n->const_val = size_of(t);
+            Node *operand = n->kids[0];
+            n->const_val = operand->kind == N_ID && operand->decl && operand->decl->is_parameter && !t->dims.empty() ? 4 : size_of(t);
             return T("INT");
         }
 
@@ -733,7 +799,7 @@ public:
                     fs.ret = t;
                     if (!fs.defined) collect_params(d->params, fs.params);
                 } else {
-                    declare(d->name, t, n->line, false);
+                    declare(d->name, t, n->line, false, d);
                 }
                 if (d->init) {
                     if (d->init->kind == N_INITLIST) {
@@ -775,9 +841,9 @@ public:
             push_scope();
             if (n->kids.size() > 0) {
                 if (n->kids[0]->kind == N_DECL) stmt(n->kids[0]);
-                else check_expr(n->kids[0]);
+                else stmt(n->kids[0]);
             }
-            if (n->kids.size() > 1) check_expr(n->kids[1]);
+            if (n->kids.size() > 1) stmt(n->kids[1]);
             loop_depth++;
             if (n->kids.size() > 3) stmt(n->kids[3]);
             loop_depth--;
@@ -828,8 +894,11 @@ public:
 
         for (size_t i = 0; i < root->kids.size(); i++) {
             Node *n = root->kids[i];
+            if (n->kind == N_DECL) {
+                for (DeclInfo *d : n->decls) if (d->init) check_expr(d->init);
+            }
             if (n->kind == N_FUNC) {
-                Type *ret = type_from(n->spec, NULL);
+                Type *ret = n->type;
                 cur_ret = ret;
                 labels.clear();
                 collect_labels(n);
@@ -837,17 +906,19 @@ public:
                 push_scope();
                 for (size_t k = 0; k < n->decl->params.size(); k++) {
                     DeclInfo *p = n->decl->params[k];
+                    p->is_parameter = true;
                     if (p->name.empty()) continue;
                     Type *pt = type_from(p->spec, p);
                     if (pt->base == "VOID" && pt->ptr_depth == 0 && pt->dims.empty())
                         continue;
-                    declare(p->name, pt, n->line, false);
+                    declare(p->name, pt, n->line, false, p);
                 }
                 loop_depth = 0;
                 for (size_t k = 0; k < n->kids.size(); k++) stmt(n->kids[k]);
                 pop_scope();
             }
         }
+        saved_structs = structs;
         return errors;
     }
 };
@@ -862,5 +933,58 @@ int semantic_check(Node *root, const char *filename) {
 
 int semantic_type_size(const Type &t) {
     Sem s("<sizeof>");
+    s.structs = saved_structs;
     return s.size_of(&t);
+}
+
+int semantic_type_alignment(const Type &t) {
+    Sem s("<alignment>");
+    s.structs = saved_structs;
+    return s.alignment_of(t);
+}
+
+int semantic_member_offset(const Type &t, const std::string &name) {
+    auto it = saved_structs.find(t.tag());
+    if (it == saved_structs.end()) return -1;
+    for (size_t i = 0; i < it->second.members.size(); i++)
+        if (it->second.members[i].first == name) return it->second.offsets[i];
+    return -1;
+}
+
+std::vector<std::pair<std::string, Type>> semantic_struct_members(const Type &t) {
+    std::vector<std::pair<std::string, Type>> result;
+    auto it = saved_structs.find(t.tag());
+    if (it != saved_structs.end())
+        for (const auto &member : it->second.members) result.push_back({member.first, *member.second});
+    return result;
+}
+
+std::string decode_string_literal(const std::string &text) {
+    std::string result;
+    bool quoted = false;
+    for (size_t i = 0; i < text.size(); i++) {
+        char c = text[i];
+        if (c == '"') { quoted = !quoted; continue; }
+        if (!quoted) continue;
+        if (c != '\\' || i + 1 == text.size()) { result += c; continue; }
+        c = text[++i];
+        switch (c) {
+            case 'n': result += '\n'; break;
+            case 't': result += '\t'; break;
+            case 'r': result += '\r'; break;
+            case 'a': result += '\a'; break;
+            case 'b': result += '\b'; break;
+            case 'f': result += '\f'; break;
+            case 'v': result += '\v'; break;
+            default:
+                if (c >= '0' && c <= '7') {
+                    int v = c - '0', count = 1;
+                    while (count < 3 && i + 1 < text.size() && text[i + 1] >= '0' && text[i + 1] <= '7') {
+                        v = v * 8 + text[++i] - '0'; count++;
+                    }
+                    result += (char)v;
+                } else result += c;
+        }
+    }
+    return result;
 }
