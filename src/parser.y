@@ -616,9 +616,11 @@ postfix_expression
                                                   append($$, $1); free($3); }
     | postfix_expression INC                    { $$ = mk_node(N_UN, token_line);
                                                   $$->op = "++";
+                                                  $$->postfix = true;
                                                   append($$, $1); }
     | postfix_expression DEC                    { $$ = mk_node(N_UN, token_line);
                                                   $$->op = "--";
+                                                  $$->postfix = true;
                                                   append($$, $1); }
     ;
 
