@@ -10,9 +10,15 @@ src/parser
 src/parser.exe
 src/irgen
 src/irgen.exe
+src/targetgen
+src/targetgen.exe
 
 tests/ir_tests/out/
+tests/target_tests/out/*
+!tests/target_tests/out/.gitkeep
 
 src/notes.txt
+
+README.md
 
 .vscode/
