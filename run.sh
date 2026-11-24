@@ -1,20 +1,36 @@
+#!/usr/bin/env bash
+
 VALID_DIR=tests/parser_tests/valid
 INVALID_DIR=tests/parser_tests/invalid
 IR_DIR=tests/ir_tests
 IR_OUT=$IR_DIR/out
+TARGET_DIR=tests/target_tests
+TARGET_OUT=$TARGET_DIR/out
+TARGET_INPUT=$TARGET_DIR/input
 
 VERBOSE=0
 MODE=parser
 ONLY=
+EXECUTE=0
+COMPILER=
+SPIM=${SPIM:-spim}
 
 usage() {
-    echo "usage: ./run.sh [--lexer | --ir] [--verbose] [test-name | path/to/test.c]"
+    echo "usage: ./run.sh [--lexer | --ir | --target] [--execute] [--verbose] [--exe executable] [test-name | path/to/test.c]"
+    echo "  --execute  run target assembly with SPIM and report execution errors"
 }
 
-for arg in "$@"; do
+while [ "$#" -gt 0 ]; do
+    arg="$1"
+    shift
     case "$arg" in
         --lexer)   MODE=lexer ;;
         --ir)      MODE=ir ;;
+        --target|--mips) MODE=target ;;
+        --execute) EXECUTE=1 ;;
+        --exe)
+            [ "$#" -gt 0 ] || { usage >&2; exit 2; }
+            COMPILER="$1"; shift ;;
         --verbose) VERBOSE=1 ;;
         -h|--help) usage; exit 0 ;;
         -*)
@@ -26,7 +42,12 @@ for arg in "$@"; do
     esac
 done
 
+if [ "$EXECUTE" -eq 1 ]; then
+    [ "$MODE" = target ] || { echo "--execute requires --target" >&2; exit 2; }
+    command -v "$SPIM" >/dev/null 2>&1 || { echo "SPIM not found. Install spim, or set SPIM to its executable path." >&2; exit 2; }
+fi
 
+if [ -z "$COMPILER" ]; then
 echo "Building..."
 if ! make clean >/dev/null 2>&1 || ! make; then
     echo "Build failed." >&2
@@ -34,6 +55,9 @@ if ! make clean >/dev/null 2>&1 || ! make; then
 fi
 echo "Build successful."
 echo
+else
+    [ -x "$COMPILER" ] || { echo "Executable not found: $COMPILER" >&2; exit 2; }
+fi
 
 PASS=0
 FAIL=0
@@ -51,7 +75,7 @@ if [ "$MODE" = lexer ]; then
         echo "=============================================================="
         echo "Lexing: $(basename "$testfile")"
         echo "--------------------------------------------------------------"
-        ./src/lex < "$testfile"
+        "${COMPILER:-./src/lex}" < "$testfile"
         echo
     done
 
@@ -60,6 +84,94 @@ if [ "$MODE" = lexer ]; then
     exit 0
 fi
 
+if [ "$MODE" = target ]; then
+    COMPILER=${COMPILER:-./src/targetgen}
+    if [ ! -x "$COMPILER" ] && [ -x "$COMPILER.exe" ]; then COMPILER="$COMPILER.exe"; fi
+    [ -x "$COMPILER" ] || { echo "Error: targetgen executable not found in ./src/" >&2; exit 1; }
+    mkdir -p "$TARGET_OUT"
+
+    # Generate first; invalid programs must fail and leave no assembly, including stale output.
+    target_one() {
+        local testfile="$1" base name assembly out status log program_out input
+        base=$(basename "$testfile")
+        name="${base%.c}"
+        assembly="$TARGET_OUT/$name.asm"
+        rm -f "$assembly"
+        out=$("$COMPILER" -o "$assembly" "$testfile" 2>&1)
+        status=$?
+        case "$base" in
+            bad*)
+                if [ "$status" -ne 0 ] && [ ! -f "$assembly" ]; then
+                    PASS=$((PASS + 1))
+                    printf 'PASS  %-20s rejected, no assembly written\n' "$base"
+                else
+                    FAIL=$((FAIL + 1))
+                    printf 'FAIL  %-20s expected rejection without assembly\n' "$base"
+                    printf '%s\n' "$out" | sed 's/^/        | /'
+                fi
+                if [ "$VERBOSE" -eq 1 ]; then printf '%s\n' "$out" | sed 's/^/        | /'; fi
+                return ;;
+        esac
+        if [ "$status" -ne 0 ] || [ ! -s "$assembly" ]; then
+            FAIL=$((FAIL + 1))
+            printf 'FAIL  %-20s expected assembly, exit %d\n' "$base" "$status"
+            printf '%s\n' "$out" | sed 's/^/        | /'
+            return
+        fi
+        if [ "$EXECUTE" -eq 1 ]; then
+            log="$TARGET_OUT/$name.log"
+            program_out="$TARGET_OUT/$name.output"
+            input="$PWD/$TARGET_INPUT/$name.stdin"
+            [ -f "$input" ] || input=/dev/null
+            if command -v timeout >/dev/null 2>&1; then
+                (cd "$TARGET_OUT" && timeout 15 "$SPIM" -file "$name.asm" < "$input") > "$log" 2>&1
+            else
+                (cd "$TARGET_OUT" && "$SPIM" -file "$name.asm" < "$input") > "$log" 2>&1
+            fi
+            status=$?
+            sed '1,/^Loaded:/d' "$log" > "$program_out"
+            if [ "$status" -ne 0 ] || grep -qiE 'Exception occurred|Exception [0-9]|syntax error|undefined|Bad address|Unknown syscall|Attempt to execute|Memory address out of bounds' "$log"; then
+                FAIL=$((FAIL + 1))
+                printf 'FAIL  %-20s SPIM execution failed, exit %d\n' "$base" "$status"
+                sed 's/^/        | /' "$log"
+                return
+            fi
+        fi
+        PASS=$((PASS + 1))
+        printf 'PASS  %-20s -> %s' "$base" "$assembly"
+        [ "$EXECUTE" -eq 0 ] || printf ' (SPIM ran successfully)'
+        printf '\n'
+        if [ "$VERBOSE" -eq 1 ]; then
+            if [ "$EXECUTE" -eq 1 ]; then sed 's/^/        | /' "$program_out";
+            else printf '%s\n' "$out" | sed 's/^/        | /'; fi
+        fi
+    }
+
+    if [ -n "$ONLY" ]; then
+        if [ -f "$ONLY" ]; then target="$ONLY";
+        elif [ -f "$TARGET_DIR/${ONLY%.c}.c" ]; then target="$TARGET_DIR/${ONLY%.c}.c";
+        else
+            echo "No such target test: $ONLY" >&2
+            ls "$TARGET_DIR"/*.c 2>/dev/null | sed 's|.*/|  |' >&2
+            exit 2
+        fi
+        if [ "$EXECUTE" -eq 1 ]; then VERBOSE=1; fi
+        target_one "$target"
+    else
+        echo "=============================================================="
+        echo "MIPS programs -- valid feature tests and invalid bad*.c tests"
+        echo "=============================================================="
+        for testfile in "$TARGET_DIR"/*.c; do
+            [ -e "$testfile" ] || continue
+            target_one "$testfile"
+        done
+    fi
+    echo "=============================================================="
+    echo "Summary: $PASS/$((PASS + FAIL)) passed"
+    echo "=============================================================="
+    [ "$FAIL" -eq 0 ] || exit 1
+    exit 0
+fi
 
 if [ "$MODE" = ir ]; then
 
@@ -103,7 +215,7 @@ if [ "$MODE" = ir ]; then
         name="${base%.c}"
         ir="$IR_OUT/$name.ir"
 
-        out=$(./src/irgen -o "$ir" "$testfile" 2>&1)
+        out=$("${COMPILER:-./src/irgen}" -o "$ir" "$testfile" 2>&1)
         status=$?
 
         if [ "$expect" = error ]; then
@@ -187,6 +299,7 @@ if [ "$MODE" = ir ]; then
     echo "=============================================================="
     for testfile in "$IR_DIR"/*.c; do
         [ -e "$testfile" ] || continue
+        [ -s "$testfile" ] || continue
         [ "$(expect_for "$testfile")" = clean ] || continue
         ir_one "$testfile" clean
     done
@@ -197,6 +310,7 @@ if [ "$MODE" = ir ]; then
     echo "=============================================================="
     for testfile in "$IR_DIR"/*.c; do
         [ -e "$testfile" ] || continue
+        [ -s "$testfile" ] || continue
         [ "$(expect_for "$testfile")" = error ] || continue
         ir_one "$testfile" error
     done
@@ -230,7 +344,7 @@ run_one() {
     local base out status
 
     base=$(basename "$testfile")
-    out=$(./src/parser "$testfile" 2>&1)
+    out=$("${COMPILER:-./src/parser}" "$testfile" 2>&1)
     status=$?
 
     if { [ "$expect" = clean ] && [ "$status" -eq 0 ]; } ||
@@ -327,3 +441,5 @@ echo "./run.sh test5      to run one test and see its full output"
 echo "./run.sh --verbose  to see full output for everything"
 echo "./run.sh --lexer    for the phase 1 lexeme tables"
 echo "./run.sh --ir       for the phase 3 intermediate code"
+echo "./run.sh --target   for MIPS assembly"
+echo "./run.sh --target --execute  to run assembly with SPIM"
